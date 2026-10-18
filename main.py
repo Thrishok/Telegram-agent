@@ -13,9 +13,15 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
 from tavily import TavilyClient
 import uvicorn
+from dotenv import load_dotenv
 
 # ---------------------------------------------------------
-# API Keys â€” all via os.getenv()
+# Load .env file — MUST happen before reading env vars
+# ---------------------------------------------------------
+load_dotenv()
+
+# ---------------------------------------------------------
+# API Keys — all via os.getenv()
 # ---------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
@@ -60,7 +66,7 @@ SYSTEM_PROMPT = """You are a helpful assistant with access to:
 1. web_search(query) - search the web for current information, facts, and real-world knowledge
 2. search_docs(query) - search internal documents
 
-CRITICAL: You MUST call web_search for ANY question about real-world facts, current events, people, places, dates, or anything requiring up-to-date information. NEVER answer factual questions from your own knowledge â€” always verify with web_search first. Only answer directly for simple greetings or conversational responses."""
+CRITICAL: You MUST call web_search for ANY question about real-world facts, current events, people, places, dates, or anything requiring up-to-date information. NEVER answer factual questions from your own knowledge — always verify with web_search first. Only answer directly for simple greetings or conversational responses."""
 
 def tool_calling_node(state: State):
     response = llm_with_tools.invoke(state["messages"])
@@ -77,7 +83,7 @@ builder.add_edge("tools", "tool_calling_node")
 graph = builder.compile()
 
 # ---------------------------------------------------------
-# Vision LLM (from telebot notebook â€” temperature 0.0 for vision)
+# Vision LLM (from telebot notebook — temperature 0.0 for vision)
 # ---------------------------------------------------------
 vision_llm = ChatGroq(
     model="qwen/qwen3.8-27b",
@@ -197,5 +203,27 @@ async def telegram_webhook(request: Request):
 async def health_check():
     return {"status": "running"}
 
+# ---------------------------------------------------------
+# Webhook setup — call this once after starting the server
+# to tell Telegram where to send messages
+# Usage: GET /set-webhook?url=https://your-public-url/telegram-webhook
+# ---------------------------------------------------------
+@app.get("/set-webhook")
+async def set_webhook(url: str = None):
+    if not url:
+        return {"error": "Provide ?url=https://your-public-url/telegram-webhook"}
+    webhook_url = url.rstrip("/") + "/telegram-webhook"
+    resp = requests.get(
+        f"{TELEGRAM_API_URL}/setWebhook",
+        params={"url": webhook_url},
+    )
+    return resp.json()
+
+@app.get("/webhook-info")
+async def webhook_info():
+    resp = requests.get(f"{TELEGRAM_API_URL}/getWebhookInfo")
+    return resp.json()
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+        
