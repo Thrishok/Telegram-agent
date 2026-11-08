@@ -2,8 +2,13 @@ fastapi
 uvicorn
 requests
 langgraph
+langgraph-checkpoint-postgres
+langgraph-store-postgres
 langchain-core
 langchain-groq
+langchain-community
 tavily-python
 python-dotenv
 langsmith
+langmem
+psycopg[binary,pool]

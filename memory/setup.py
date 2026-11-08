@@ -1,0 +1,66 @@
+"""
+Database setup script for memory module.
+Run with: python -m memory.setup
+"""
+import asyncio
+import os
+import sys
+import psycopg
+from langgraph.checkpoint.postgres import PostgresSaver
+from langgraph.store.postgres import PostgresStore
+from langgraph.store.base import IndexConfig
+from dotenv import load_dotenv
+
+# Load environment from .env in project root
+load_dotenv()
+
+DATABASE_URL_DIRECT = os.getenv('DATABASE_URL_DIRECT') or os.getenv('DATABASE_URL')
+EMBEDDING_DIMS = int(os.getenv('EMBEDDING_DIMS', '384'))
+EMBEDDING_MODEL = os.getenv('EMBEDDING_MODEL', 'all-MiniLM-L6-v2')
+
+
+async def setup_database():
+    print("Starting database setup...")
+    if not DATABASE_URL_DIRECT:
+        print("Error: DATABASE_URL_DIRECT not set")
+        return
+
+    try:
+        # Use DIRECT connection for extensions and setup
+        async with await psycopg.AsyncConnection.connect(DATABASE_URL_DIRECT, autocommit=True) as conn:
+            print("Enabling pgvector extension...")
+            await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+
+            # Initialize Checkpointer
+            print("Initializing PostgresSaver checkpointer...")
+            checkpointer = PostgresSaver(conn)
+            await checkpointer.setup()
+
+            # Initialize Store
+            print("Initializing PostgresStore...")
+            index_config: IndexConfig = {
+                "dims": EMBEDDING_DIMS,
+                "embed": EMBEDDING_MODEL
+            }
+            store = PostgresStore(conn, index=index_config)
+            await store.setup()
+
+        print("Database setup completed successfully.")
+    except Exception as e:
+        print(f"Error during database setup: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def main():
+    # Use SelectorEventLoop for psycopg on Windows
+    loop = asyncio.SelectorEventLoop()
+    try:
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(setup_database())
+    finally:
+        loop.close()
+
+
+if __name__ == "__main__":
+    main()
