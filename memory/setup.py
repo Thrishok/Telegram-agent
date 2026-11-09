@@ -26,24 +26,21 @@ async def setup_database():
         return
 
     try:
-        # Use DIRECT connection for extensions and setup
         async with await psycopg.AsyncConnection.connect(DATABASE_URL_DIRECT, autocommit=True) as conn:
             print("Enabling pgvector extension...")
             await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
 
-            # Initialize Checkpointer
-            print("Initializing PostgresSaver checkpointer...")
-            checkpointer = PostgresSaver(conn)
-            await checkpointer.setup()
+        print("Initializing PostgresSaver checkpointer...")
+        with PostgresSaver.from_conn_string(DATABASE_URL_DIRECT) as checkpointer:
+            checkpointer.setup()
 
-            # Initialize Store
-            print("Initializing PostgresStore...")
-            index_config: IndexConfig = {
-                "dims": EMBEDDING_DIMS,
-                "embed": EMBEDDING_MODEL
-            }
-            store = PostgresStore(conn, index=index_config)
-            await store.setup()
+        print("Initializing PostgresStore...")
+        index_config: IndexConfig = {
+            "dims": EMBEDDING_DIMS,
+            "embed": EMBEDDING_MODEL
+        }
+        with PostgresStore.from_conn_string(DATABASE_URL_DIRECT, index=index_config) as store:
+            store.setup()
 
         print("Database setup completed successfully.")
     except Exception as e:
