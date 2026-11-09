@@ -4,8 +4,8 @@ Run with: python -m memory.setup
 """
 import asyncio
 import os
-import sys
 import psycopg
+from sentence_transformers import SentenceTransformer
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.store.postgres import PostgresStore
 from langgraph.store.base import IndexConfig
@@ -35,9 +35,13 @@ async def setup_database():
             checkpointer.setup()
 
         print("Initializing PostgresStore...")
+        _model = SentenceTransformer(EMBEDDING_MODEL)
+        def embed(texts: list[str]) -> list[list[float]]:
+            return _model.encode(texts, normalize_embeddings=True).tolist()
+
         index_config: IndexConfig = {
             "dims": EMBEDDING_DIMS,
-            "embed": EMBEDDING_MODEL
+            "embed": embed
         }
         with PostgresStore.from_conn_string(DATABASE_URL_DIRECT, index=index_config) as store:
             store.setup()

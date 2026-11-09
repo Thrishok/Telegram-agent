@@ -12,3 +12,4 @@ python-dotenv
 langsmith
 langmem
 psycopg[binary,pool]
+sentence-transformers
