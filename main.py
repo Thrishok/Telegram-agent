@@ -22,12 +22,6 @@ import uvicorn
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------
-# Windows compatibility: Use SelectorEventLoop for psycopg
-# ---------------------------------------------------------
-if sys.platform == 'win32':
-    asyncio.set_event_loop(asyncio.SelectorEventLoop())
-
-# ---------------------------------------------------------
 # Load .env file — MUST happen before reading env vars
 # ---------------------------------------------------------
 load_dotenv()
@@ -293,7 +287,7 @@ _pool = None
 
 async def initialize_memory():
     """Initialize the checkpointer and store at startup."""
-    global graph, _checkpointer, _pool
+    global graph, _checkpointer, _pool, _store
 
     if not DATABASE_URL_DIRECT:
         logger.warning("DATABASE_URL_DIRECT not set, running without persistent memory")
@@ -302,34 +296,35 @@ async def initialize_memory():
     try:
         from psycopg_pool import AsyncConnectionPool
 
-        # Create pool with PgBouncer settings
-        _pool = AsyncConnectionPool(
+        # Create pool with PgBouncer settings - use async context manager
+        async with AsyncConnectionPool(
             conninfo=DATABASE_URL_DIRECT,
             max_size=10,
             min_size=1,
             kwargs={"prepare_threshold": 0, "autocommit": True},
-        )
+        ) as pool:
+            _pool = pool
 
-        # Create checkpointer for short-term memory
-        async with _pool.connection() as conn:
-            _checkpointer = PostgresSaver(conn)
-            await _checkpointer.setup()
+            # Create checkpointer for short-term memory
+            async with pool.connection() as conn:
+                _checkpointer = PostgresSaver(conn)
+                await _checkpointer.setup()
 
-        # Create store for long-term memory
-        async with _pool.connection() as conn:
-            index_config = {
-                "dims": EMBEDDING_DIMS,
-                "embed": EMBEDDING_MODEL
-            }
-            store = PostgresStore(conn, index=index_config)
-            await store.setup()
+            # Create store for long-term memory
+            async with pool.connection() as conn:
+                index_config = {
+                    "dims": EMBEDDING_DIMS,
+                    "embed": EMBEDDING_MODEL
+                }
+                _store = PostgresStore(conn, index=index_config)
+                await _store.setup()
 
-            # Register memory tools with store (sets _store_ref)
-            register_memory_tools(store)
+                # Register memory tools with store (sets _store_ref)
+                register_memory_tools(_store)
 
         # Rebuild graph with memory tools and checkpointer
         graph = build_graph()
-        compiled = graph.compile(checkpointer=_checkpointer)
+        graph = graph.compile(checkpointer=_checkpointer)
 
         logger.info("Memory layer initialized successfully")
 
@@ -337,6 +332,7 @@ async def initialize_memory():
         logger.error(f"Failed to initialize memory layer: {e}")
         import traceback
         traceback.print_exc()
+        # Continue without memory - don't crash
 
 # ---------------------------------------------------------
 # FastAPI App
@@ -435,4 +431,12 @@ async def memory_delete_user(chat_id: int):
     return {"error": "Use direct database connection for memory operations"}
 
 if __name__ == "__main__":
+    # Windows: Use SelectorEventLoop for psycopg compatibility
+    if sys.platform == 'win32':
+        try:
+            loop = asyncio.SelectorEventLoop()
+            asyncio.set_event_loop(loop)
+        except Exception as e:
+            logger.warning(f"Could not set SelectorEventLoop: {e}")
+
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
