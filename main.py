@@ -1,442 +1,338 @@
 import os
 import base64
 import tempfile
-import json
 import logging
-import requests
 import asyncio
 import sys
-from concurrent.futures import ThreadPoolExecutor
-from typing import Annotated, Any
+import requests
+from typing import Annotated
 from typing_extensions import TypedDict
-from fastapi import FastAPI, Request
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request, BackgroundTasks
+from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage
+from langchain_core.tools import tool
+from langchain_groq import ChatGroq
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
-from langchain_core.tools import tool
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, BaseMessage
-from langgraph.checkpoint.postgres import PostgresSaver
-from langgraph.store.postgres import PostgresStore
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.store.postgres.aio import AsyncPostgresStore
+from psycopg_pool import AsyncConnectionPool
+from sentence_transformers import SentenceTransformer
 from tavily import TavilyClient
-import uvicorn
 from dotenv import load_dotenv
+import uvicorn
 
-# ---------------------------------------------------------
-# Load .env file — MUST happen before reading env vars
-# ---------------------------------------------------------
 load_dotenv()
 
 # ---------------------------------------------------------
-# API Keys — all via os.getenv()
+# Config
 # ---------------------------------------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
+BOT_TOKEN        = os.getenv("BOT_TOKEN", "")
+GROQ_API_KEY     = os.getenv("GROQ_API_KEY", "")
+TAVILY_API_KEY   = os.getenv("TAVILY_API_KEY", "")
+DATABASE_URL     = os.getenv("DATABASE_URL")
+DATABASE_URL_DIRECT = os.getenv("DATABASE_URL_DIRECT", DATABASE_URL)
+EMBEDDING_MODEL  = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+EMBEDDING_DIMS   = int(os.getenv("EMBEDDING_DIMS", "384"))
+SHORT_TERM_WINDOW = int(os.getenv("SHORT_TERM_WINDOW", "10"))
+MEMORY_TOP_K     = int(os.getenv("MEMORY_TOP_K", "5"))
+ENABLE_MEMORY_EXTRACTION = os.getenv("ENABLE_MEMORY_EXTRACTION", "true").lower() == "true"
+MEMORY_EXTRACTION_MODEL  = os.getenv("MEMORY_EXTRACTION_MODEL", "openai/gpt-oss-120b")
+EPISODE_TTL_DAYS = int(os.getenv("EPISODE_TTL_DAYS", "90"))
 
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# ---------------------------------------------------------
-# Logging setup
-# ---------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------
-# Memory configuration
+# Embedder (shared instance)
 # ---------------------------------------------------------
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
-EMBEDDING_DIMS = int(os.getenv("EMBEDDING_DIMS", "384"))
-SHORT_TERM_WINDOW = int(os.getenv("SHORT_TERM_WINDOW", "10"))
-MEMORY_TOP_K = int(os.getenv("MEMORY_TOP_K", "5"))
-DATABASE_URL = os.getenv("DATABASE_URL")
-DATABASE_URL_DIRECT = os.getenv("DATABASE_URL_DIRECT", DATABASE_URL)
+_embedder = SentenceTransformer(EMBEDDING_MODEL)
+
+def embed(texts: list[str]) -> list[list[float]]:
+    return _embedder.encode(texts, normalize_embeddings=True).tolist()
 
 # ---------------------------------------------------------
-# Tools (from agent notebook)
+# LLMs
 # ---------------------------------------------------------
 tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
 
 @tool
 def web_search(query: str) -> str:
-    """browser search tool to get latest news and confirms facts when not sure about that"""
-    response = tavily_client.search(query=query, max_results=3)
-    results = response.get("results", [])
-    ans = "\n\n".join(f"{r['title']}: {r['content']}" for r in results)
-    return ans
+    """Search the web for current information, facts, and real-world knowledge."""
+    results = tavily_client.search(query=query, max_results=3).get("results", [])
+    return "\n\n".join(f"{r['title']}: {r['content']}" for r in results)
 
 @tool
 def search_docs(query: str) -> str:
     """Search internal documents for a given query."""
     return f"Found 3 results for '{query}'."
 
-# ---------------------------------------------------------
-# Memory tools (will be created with actual store at runtime)
-# ---------------------------------------------------------
-memory_tools = []
-_store_ref = None  # Will hold the memory store reference
+AGENT_TOOLS = [web_search, search_docs]
 
-def register_memory_tools(store):
-    """Register memory tools with the actual store instance."""
-    global memory_tools, _store_ref
-    _store_ref = store
-    from memory.tools import get_memory_tools
-    memory_tools = get_memory_tools(store, MEMORY_TOP_K)
-
-# ---------------------------------------------------------
-# LLM setup
-# ---------------------------------------------------------
-from langchain_groq import ChatGroq
-llm = ChatGroq(
-    model="openai/gpt-oss-120b",
-    temperature=0.5,
-    api_key=GROQ_API_KEY,
-)
-llm_with_tools = llm.bind_tools([web_search, search_docs])
+llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.5, api_key=GROQ_API_KEY)
+vision_llm = ChatGroq(model="qwen/qwen3.8-27b", temperature=0.0, api_key=GROQ_API_KEY)
 
 SYSTEM_PROMPT = """You are a helpful assistant with access to:
-1. web_search(query) - search the web for current information, facts, and real-world knowledge
+1. web_search(query) - search the web for current information
 2. search_docs(query) - search internal documents
 
-CRITICAL: You MUST call web_search for ANY question about real-world facts, current events, people, places, dates, or anything requiring up-to-date information. NEVER answer factual questions from your own knowledge — always verify with web_search first. Only answer directly for simple greetings or conversational responses."""
+CRITICAL: Call web_search for ANY factual question. Only answer directly for simple greetings."""
 
 # ---------------------------------------------------------
-# State definition with memory support
+# State
 # ---------------------------------------------------------
 class State(TypedDict):
     messages: Annotated[list, add_messages]
-    context_messages: Annotated[list, add_messages] = []  # Working context after memory loading
-    thread_id: str = ""  # Telegram chat_id for thread identification
-    summary: str = ""  # Running summary for long conversations
-    user_profile: dict = {}  # Profile data from memory
+    context_messages: list
+    thread_id: str
+    summary: str
+    user_profile: dict
 
 # ---------------------------------------------------------
-# Token estimation helper
+# Graph nodes (store injected via closure at startup)
 # ---------------------------------------------------------
-def simple_token_estimate(text: str) -> int:
-    """Simple character-to-token estimation (approx 1 token per 4 chars)."""
-    if isinstance(text, str):
-        return len(text) // 4
-    return 0
+_store: AsyncPostgresStore | None = None
 
-# ---------------------------------------------------------
-# Memory node - loads user context and profile from store
-# ---------------------------------------------------------
-def load_memory_node(state: State) -> dict:
-    """Load user memory from long-term store and assemble context."""
+async def load_memory_node(state: State) -> dict:
+    """Load profile + top-k facts/episodes, assemble context."""
     thread_id = state.get("thread_id", "")
+    messages   = state.get("messages", [])
+    recent     = messages[-SHORT_TERM_WINDOW:]
 
-    messages = state.get("messages", [])
-    recent = messages[-SHORT_TERM_WINDOW:] if len(messages) > SHORT_TERM_WINDOW else messages
+    user_profile, memories = {}, []
 
-    user_profile = {}
-    retrieved_memories = []
-
-    # If we have a store reference (set after async init), use it
-    if _store_ref is not None and thread_id:
+    if _store and thread_id:
         try:
-            import asyncio
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # We're in an async context - use run_in_executor for sync store access
-                pass
-            else:
-                # Try direct sync access (PostgresStore has sync methods)
-                profile_result = _store_ref.get(("users", thread_id, "profile"))
-                if profile_result:
-                    user_profile = profile_result.value if hasattr(profile_result, 'value') else profile_result
-                    if not isinstance(user_profile, dict):
-                        user_profile = {}
-
-                search_results = _store_ref.search(
-                    ("users", thread_id, "facts"),
-                    query=" ".join(m.content for m in messages if isinstance(m, (HumanMessage, SystemMessage)))[:500],
-                    limit=MEMORY_TOP_K
-                )
-                retrieved_memories = [r.value for r in search_results]
+            item = await _store.aget(("users", thread_id, "profile"), "profile")
+            if item:
+                user_profile = item.value if isinstance(item.value, dict) else {}
         except Exception as e:
-            logger.warning(f"Failed to load memory: {e}")
+            logger.warning(f"Profile load failed: {e}")
 
-    # Build context messages
-    context_messages = []
+        try:
+            query = " ".join(m.content for m in messages if hasattr(m, "content"))[-500:]
+            facts = await _store.asearch(("users", thread_id, "facts"), query=query, limit=MEMORY_TOP_K)
+            memories = [r.value for r in facts]
+        except Exception as e:
+            logger.warning(f"Facts search failed: {e}")
 
-    # Add system prompt
-    context_messages.append(SystemMessage(content=SYSTEM_PROMPT))
+        try:
+            eps = await _store.asearch(("users", thread_id, "episodes"), query="", limit=3)
+            memories += [f"Past: {r.value.get('goal','')} → {r.value.get('outcome','')}" for r in eps if isinstance(r.value, dict)]
+        except Exception as e:
+            logger.warning(f"Episodes search failed: {e}")
 
-    # Add profile info if we have it
+    ctx: list[BaseMessage] = [SystemMessage(content=SYSTEM_PROMPT)]
     if user_profile:
-        context_messages.append(SystemMessage(content=f"User profile: {user_profile}"))
+        ctx.append(SystemMessage(content=f"User profile: {user_profile}"))
+    if memories:
+        ctx.append(SystemMessage(content="Relevant memories: " + "; ".join(str(m) for m in memories)))
+    summary = state.get("summary", "")
+    if summary:
+        ctx.append(SystemMessage(content=f"Conversation summary: {summary}"))
+    ctx.extend(recent)
 
-    # Add retrieved memories
-    if retrieved_memories:
-        context_messages.append(SystemMessage(content="Relevant memories: " + "; ".join(str(m) for m in retrieved_memories)))
+    return {**state, "context_messages": ctx, "user_profile": user_profile}
 
-    # Add recent messages
-    context_messages.extend(recent)
 
-    return {
-        **state,
-        "context_messages": context_messages,
-        "user_profile": user_profile,
-    }
-
-# ---------------------------------------------------------
-# LLM node - uses context_messages if available
-# ---------------------------------------------------------
 def call_llm_node(state: State) -> dict:
-    """Main LLM node that uses context_messages if available."""
-    messages = state.get("context_messages", state.get("messages", []))
-    response = llm_with_tools.invoke(messages)
+    messages = state.get("context_messages") or state.get("messages", [])
+    response = llm.bind_tools(AGENT_TOOLS).invoke(messages)
     return {"messages": [response]}
 
+
 # ---------------------------------------------------------
-# Graph building function
+# Background memory extraction
 # ---------------------------------------------------------
-def build_graph():
-    """Build and return the compiled graph."""
+_last_extraction: dict[str, float] = {}
+_DEBOUNCE = 30.0  # seconds
+
+async def run_extraction(thread_id: str, messages: list, response_text: str):
+    import time
+    now = time.time()
+    if now - _last_extraction.get(thread_id, 0) < _DEBOUNCE:
+        return
+    _last_extraction[thread_id] = now
+
+    if not _store or not ENABLE_MEMORY_EXTRACTION:
+        return
+
+    try:
+        from langmem import create_memory_store_manager
+        extraction_llm = ChatGroq(model=MEMORY_EXTRACTION_MODEL, temperature=0.0, api_key=GROQ_API_KEY)
+        manager = create_memory_store_manager(
+            extraction_llm,
+            namespace=("users", thread_id, "facts"),
+            store=_store,
+        )
+        await manager.ainvoke({"messages": messages + [HumanMessage(content=response_text)]})
+        logger.debug(f"Extraction done for {thread_id}")
+    except Exception as e:
+        logger.warning(f"Extraction failed for {thread_id}: {e}")
+
+
+# ---------------------------------------------------------
+# Graph + app lifecycle
+# ---------------------------------------------------------
+_graph = None
+_pool: AsyncConnectionPool | None = None
+_checkpointer: AsyncPostgresSaver | None = None
+
+def build_graph(checkpointer=None):
     builder = StateGraph(State)
     builder.add_node("load_memory", load_memory_node)
     builder.add_node("call_llm", call_llm_node)
-    builder.add_node("tools", ToolNode([web_search, search_docs] + memory_tools))
-
+    builder.add_node("tools", ToolNode(AGENT_TOOLS))
     builder.add_edge(START, "load_memory")
     builder.add_edge("load_memory", "call_llm")
     builder.add_conditional_edges("call_llm", tools_condition)
     builder.add_edge("tools", "call_llm")
+    return builder.compile(checkpointer=checkpointer)
 
-    return builder.compile()
 
-# Compile initial graph (will be rebuilt after memory init)
-graph = build_graph()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _graph, _pool, _checkpointer, _store
 
-# ---------------------------------------------------------
-# Vision LLM (from telebot notebook — temperature 0.0 for vision)
-# ---------------------------------------------------------
-vision_llm = ChatGroq(
-    model="qwen/qwen3.8-27b",
-    temperature=0.0,
-    api_key=GROQ_API_KEY,
-)
+    if DATABASE_URL:
+        try:
+            _pool = AsyncConnectionPool(
+                conninfo=DATABASE_URL,
+                max_size=10,
+                min_size=1,
+                kwargs={"prepare_threshold": 0, "autocommit": True},
+                open=False,
+            )
+            await _pool.open()
 
-# ---------------------------------------------------------
-# Helper: encode image to base64 (from telebot notebook)
-# ---------------------------------------------------------
-def encode_image(image_path):
-    with open(image_path, "rb") as image_file:
-        return base64.b64encode(image_file.read()).decode('utf-8')
-
-# ---------------------------------------------------------
-# Helper: download Telegram file (from telebot notebook)
-# ---------------------------------------------------------
-def download_telegram_file(file_id: str) -> str:
-    response = requests.get(
-        f"{TELEGRAM_API_URL}/getFile",
-        params={"file_id": file_id},
-    )
-    file_info = response.json()
-    file_path = file_info["result"]["file_path"]
-
-    download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-    file_response = requests.get(download_url)
-
-    filename = os.path.join(tempfile.gettempdir(), os.path.basename(file_path))
-    with open(filename, "wb") as f:
-        f.write(file_response.content)
-    return filename
-
-# ---------------------------------------------------------
-# Helper: analyze image with caption (from telebot notebook)
-# ---------------------------------------------------------
-def analyze_image(image_path: str, caption: str = None) -> str:
-    base64_image = encode_image(image_path)
-
-    if caption:
-        text_prompt = f"What is in this image? Please describe it in detail. Caption: {caption}"
+            _checkpointer = AsyncPostgresSaver(_pool)
+            _store = AsyncPostgresStore(
+                _pool,
+                index={"dims": EMBEDDING_DIMS, "embed": embed},
+            )
+            _graph = build_graph(checkpointer=_checkpointer)
+            logger.info("Memory layer initialized")
+        except Exception as e:
+            logger.error(f"Memory init failed: {e}; running without persistence")
+            _graph = build_graph()
     else:
-        text_prompt = "What is in this image? Please describe it in detail."
+        logger.warning("DATABASE_URL not set; running without persistence")
+        _graph = build_graph()
 
-    message = HumanMessage(
-        content=[
-            {"type": "text", "text": text_prompt},
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
-            },
-        ]
-    )
+    yield
 
-    system_message = SystemMessage(
-        content="You are a helpful assistant that analyzes images in detail and give the details in short and don't loose important information"
-    )
+    if _pool:
+        await _pool.close()
 
-    response = vision_llm.invoke([system_message, message])
+
+app = FastAPI(lifespan=lifespan)
+
+# ---------------------------------------------------------
+# Telegram helpers
+# ---------------------------------------------------------
+def encode_image(path: str) -> str:
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode()
+
+def download_telegram_file(file_id: str) -> str:
+    info = requests.get(f"{TELEGRAM_API_URL}/getFile", params={"file_id": file_id}).json()
+    file_path = info["result"]["file_path"]
+    data = requests.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}").content
+    dest = os.path.join(tempfile.gettempdir(), os.path.basename(file_path))
+    with open(dest, "wb") as f:
+        f.write(data)
+    return dest
+
+def analyze_image(image_path: str, caption: str = None) -> str:
+    b64 = encode_image(image_path)
+    prompt = f"Describe this image in detail.{' Caption: ' + caption if caption else ''}"
+    response = vision_llm.invoke([
+        SystemMessage(content="Analyze images concisely without losing important details."),
+        HumanMessage(content=[
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+        ]),
+    ])
     return response.content
 
-# ---------------------------------------------------------
-# Helper: send Telegram message (from GitHub repo)
-# ---------------------------------------------------------
 def send_message(chat_id: int, text: str):
-    url = f"{TELEGRAM_API_URL}/sendMessage"
-    response = requests.post(url, json={"chat_id": chat_id, "text": text})
-    return response.json()
+    requests.post(f"{TELEGRAM_API_URL}/sendMessage", json={"chat_id": chat_id, "text": text})
 
 # ---------------------------------------------------------
-# Async memory initialization
+# Webhook handler
 # ---------------------------------------------------------
-_checkpointer = None
-_pool = None
-
-async def initialize_memory():
-    """Initialize the checkpointer and store at startup."""
-    global graph, _checkpointer, _pool, _store
-
-    if not DATABASE_URL_DIRECT:
-        logger.warning("DATABASE_URL_DIRECT not set, running without persistent memory")
-        return
-
-    try:
-        from psycopg_pool import AsyncConnectionPool
-
-        # Create pool with PgBouncer settings - use async context manager
-        async with AsyncConnectionPool(
-            conninfo=DATABASE_URL_DIRECT,
-            max_size=10,
-            min_size=1,
-            kwargs={"prepare_threshold": 0, "autocommit": True},
-        ) as pool:
-            _pool = pool
-
-            # Create checkpointer for short-term memory
-            async with pool.connection() as conn:
-                _checkpointer = PostgresSaver(conn)
-                await _checkpointer.setup()
-
-            # Create store for long-term memory
-            async with pool.connection() as conn:
-                index_config = {
-                    "dims": EMBEDDING_DIMS,
-                    "embed": EMBEDDING_MODEL
-                }
-                _store = PostgresStore(conn, index=index_config)
-                await _store.setup()
-
-                # Register memory tools with store (sets _store_ref)
-                register_memory_tools(_store)
-
-        # Rebuild graph with memory tools and checkpointer
-        graph = build_graph()
-        graph = graph.compile(checkpointer=_checkpointer)
-
-        logger.info("Memory layer initialized successfully")
-
-    except Exception as e:
-        logger.error(f"Failed to initialize memory layer: {e}")
-        import traceback
-        traceback.print_exc()
-        # Continue without memory - don't crash
-
-# ---------------------------------------------------------
-# FastAPI App
-# ---------------------------------------------------------
-app = FastAPI()
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize memory layer on app startup."""
-    await initialize_memory()
-
 @app.post("/telegram-webhook")
-async def telegram_webhook(request: Request):
+async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
     data = await request.json()
-
     message = data.get("message")
     if not message:
         return {"ok": True}
 
     chat_id = message["chat"]["id"]
 
-    # --- Handle photo messages (from telebot notebook) ---
     if "photo" in message:
-        photo = message["photo"][-2]
-        file_id = photo["file_id"]
-        caption = message.get("caption", None)
-
         try:
-            filename = download_telegram_file(file_id)
-            reply_text = analyze_image(filename, caption)
+            path = download_telegram_file(message["photo"][-2]["file_id"])
+            reply = analyze_image(path, message.get("caption"))
         except Exception as e:
-            reply_text = f"Sorry, something went wrong: {e}"
-
-        send_message(chat_id, reply_text)
+            reply = f"Sorry, image processing failed: {e}"
+        send_message(chat_id, reply)
         return {"ok": True}
 
-    # --- Handle text messages (LangGraph agent with memory) ---
     if "text" not in message:
         return {"ok": True}
 
     user_text = message["text"]
+    thread_id = str(chat_id)
 
     try:
-        # Prepare initial state with thread_id for memory
         initial_state: State = {
-            "thread_id": str(chat_id),  # Use chat_id as thread_id
-            "messages": [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=user_text)],
+            "thread_id": thread_id,
+            "messages": [HumanMessage(content=user_text)],
+            "context_messages": [],
+            "summary": "",
+            "user_profile": {},
         }
+        result = await _graph.ainvoke(
+            initial_state,
+            config={"configurable": {"thread_id": thread_id}},
+        )
+        reply = result["messages"][-1].content
 
-        # Invoke with thread_id for short-term memory persistence
-        result = graph.invoke(initial_state, config={"configurable": {"thread_id": str(chat_id)}})
-        reply_text = result["messages"][-1].content
+        # Fire background extraction (non-blocking)
+        if ENABLE_MEMORY_EXTRACTION:
+            background_tasks.add_task(run_extraction, thread_id, result["messages"], reply)
+
     except Exception as e:
         logger.exception("Error processing message")
-        reply_text = f"Sorry, something went wrong: {e}"
+        reply = f"Sorry, something went wrong: {e}"
 
-    send_message(chat_id, reply_text)
+    send_message(chat_id, reply)
     return {"ok": True}
 
+# ---------------------------------------------------------
+# Utility endpoints
+# ---------------------------------------------------------
 @app.get("/")
-async def health_check():
-    return {"status": "running"}
+async def health():
+    return {"status": "running", "memory": _store is not None}
 
-# ---------------------------------------------------------
-# Webhook setup — call this once after starting the server
-# to tell Telegram where to send messages
-# Usage: GET /set-webhook?url=https://your-public-url/telegram-webhook
-# ---------------------------------------------------------
 @app.get("/set-webhook")
 async def set_webhook(url: str = None):
     if not url:
-        return {"error": "Provide ?url=https://your-public-url/telegram-webhook"}
-    webhook_url = url.rstrip("/") + "/telegram-webhook"
-    resp = requests.get(
-        f"{TELEGRAM_API_URL}/setWebhook",
-        params={"url": webhook_url},
-    )
+        return {"error": "Provide ?url=https://your-public-url"}
+    resp = requests.get(f"{TELEGRAM_API_URL}/setWebhook", params={"url": url.rstrip("/") + "/telegram-webhook"})
     return resp.json()
 
 @app.get("/webhook-info")
 async def webhook_info():
-    resp = requests.get(f"{TELEGRAM_API_URL}/getWebhookInfo")
-    return resp.json()
-
-# ---------------------------------------------------------
-# Memory management endpoints
-# ---------------------------------------------------------
-@app.post("/memory/search")
-async def memory_search(query: str, namespace_key: str = '["users", "1", "facts"]'):
-    """Search memories. For testing only."""
-    return {"error": "Use direct database connection for memory operations"}
-
-@app.post("/memory/delete-user")
-async def memory_delete_user(chat_id: int):
-    """Delete all memories for a user."""
-    return {"error": "Use direct database connection for memory operations"}
+    return requests.get(f"{TELEGRAM_API_URL}/getWebhookInfo").json()
 
 if __name__ == "__main__":
-    # Windows: Use SelectorEventLoop for psycopg compatibility
-    if sys.platform == 'win32':
-        try:
-            loop = asyncio.SelectorEventLoop()
-            asyncio.set_event_loop(loop)
-        except Exception as e:
-            logger.warning(f"Could not set SelectorEventLoop: {e}")
-
+    if sys.platform == "win32":
+        asyncio.set_event_loop(asyncio.SelectorEventLoop())
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))

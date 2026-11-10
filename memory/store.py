@@ -1,18 +1,16 @@
-from typing import AsyncGenerator, Dict, Any
+from typing import AsyncGenerator
 from contextlib import asynccontextmanager
-from langgraph.store.postgres import PostgresStore
-from langgraph.store.base import IndexConfig
+from sentence_transformers import SentenceTransformer
+from langgraph.store.postgres.aio import AsyncPostgresStore
 from memory.config import get_db_pool, EMBEDDING_DIMS, EMBEDDING_MODEL
 
+_embedder = SentenceTransformer(EMBEDDING_MODEL)
+
+def _embed(texts: list[str]) -> list[list[float]]:
+    return _embedder.encode(texts, normalize_embeddings=True).tolist()
+
 @asynccontextmanager
-async def get_store() -> AsyncGenerator[PostgresStore, None]:
+async def get_store() -> AsyncGenerator[AsyncPostgresStore, None]:
     pool = await get_db_pool()
-    async with pool.connection() as conn:
-        # Index config enables vector search with pgvector
-        # The embed parameter is informational - actual embeddings come from our extraction
-        index_config: IndexConfig = {
-            "dims": EMBEDDING_DIMS,
-            "embed": EMBEDDING_MODEL
-        }
-        store = PostgresStore(conn, index=index_config)
-        yield store
+    store = AsyncPostgresStore(pool, index={"dims": EMBEDDING_DIMS, "embed": _embed})
+    yield store

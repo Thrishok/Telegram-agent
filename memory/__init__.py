@@ -12,42 +12,46 @@ Namespaces in store:
 - ("agent", "procedures"): Learned rules (feature-flagged)
 """
 
-from memory.config import (
-    get_db_pool,
-    close_db_pool,
-    DATABASE_URL,
-    DATABASE_URL_DIRECT,
-    EMBEDDING_MODEL,
-    EMBEDDING_DIMS,
-    SHORT_TERM_WINDOW,
-    MEMORY_TOP_K,
-    EPISODE_TTL_DAYS,
-    ENABLE_MEMORY_EXTRACTION,
-    MEMORY_EXTRACTION_MODEL,
-)
-from memory.checkpointer import get_checkpointer
-from memory.store import get_store
-from memory.nodes import load_memory, trim_messages_for_budget
-from memory.extraction import extract_memory, should_extract
-from memory.tools import get_memory_tools
+import os as _os
 
-__all__ = [
-    "get_db_pool",
-    "close_db_pool",
-    "DATABASE_URL",
-    "DATABASE_URL_DIRECT",
-    "EMBEDDING_MODEL",
-    "EMBEDDING_DIMS",
-    "SHORT_TERM_WINDOW",
-    "MEMORY_TOP_K",
-    "EPISODE_TTL_DAYS",
-    "ENABLE_MEMORY_EXTRACTION",
-    "MEMORY_EXTRACTION_MODEL",
-    "get_checkpointer",
-    "get_store",
-    "load_memory",
-    "trim_messages_for_budget",
-    "extract_memory",
-    "should_extract",
-    "get_memory_tools",
-]
+# Skip heavy imports when running setup script to avoid circular/premature init
+if _os.environ.get("_MEMORY_SETUP") != "1":
+    from memory.config import (
+        get_db_pool,
+        close_db_pool,
+        DATABASE_URL,
+        DATABASE_URL_DIRECT,
+        EMBEDDING_MODEL,
+        EMBEDDING_DIMS,
+        SHORT_TERM_WINDOW,
+        MEMORY_TOP_K,
+        EPISODE_TTL_DAYS,
+        ENABLE_MEMORY_EXTRACTION,
+        MEMORY_EXTRACTION_MODEL,
+    )
+    from memory.checkpointer import get_checkpointer
+    from memory.store import get_store
+    from memory.nodes import load_memory, trim_messages_for_budget
+    from memory.extraction import extract_memory, should_extract
+    from memory.tools import get_memory_tools
+
+    __all__ = [
+        "get_db_pool",
+        "close_db_pool",
+        "DATABASE_URL",
+        "DATABASE_URL_DIRECT",
+        "EMBEDDING_MODEL",
+        "EMBEDDING_DIMS",
+        "SHORT_TERM_WINDOW",
+        "MEMORY_TOP_K",
+        "EPISODE_TTL_DAYS",
+        "ENABLE_MEMORY_EXTRACTION",
+        "MEMORY_EXTRACTION_MODEL",
+        "get_checkpointer",
+        "get_store",
+        "load_memory",
+        "trim_messages_for_budget",
+        "extract_memory",
+        "should_extract",
+        "get_memory_tools",
+    ]

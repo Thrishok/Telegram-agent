@@ -6,9 +6,8 @@ import asyncio
 import os
 import psycopg
 from sentence_transformers import SentenceTransformer
-from langgraph.checkpoint.postgres import PostgresSaver
-from langgraph.store.postgres import PostgresStore
-from langgraph.store.base import IndexConfig
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.store.postgres.aio import AsyncPostgresStore
 from dotenv import load_dotenv
 
 # Load environment from .env in project root
@@ -31,20 +30,16 @@ async def setup_database():
             await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
 
         print("Initializing PostgresSaver checkpointer...")
-        with PostgresSaver.from_conn_string(DATABASE_URL_DIRECT) as checkpointer:
-            checkpointer.setup()
+        async with AsyncPostgresSaver.from_conn_string(DATABASE_URL_DIRECT) as checkpointer:
+            await checkpointer.setup()
 
         print("Initializing PostgresStore...")
         _model = SentenceTransformer(EMBEDDING_MODEL)
         def embed(texts: list[str]) -> list[list[float]]:
             return _model.encode(texts, normalize_embeddings=True).tolist()
 
-        index_config: IndexConfig = {
-            "dims": EMBEDDING_DIMS,
-            "embed": embed
-        }
-        with PostgresStore.from_conn_string(DATABASE_URL_DIRECT, index=index_config) as store:
-            store.setup()
+        async with AsyncPostgresStore.from_conn_string(DATABASE_URL_DIRECT, index={"dims": EMBEDDING_DIMS, "embed": embed}) as store:
+            await store.setup()
 
         print("Database setup completed successfully.")
     except Exception as e:

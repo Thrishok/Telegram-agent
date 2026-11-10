@@ -80,7 +80,7 @@ async def extract_memory(
 async def simple_fact_extract(
     thread_id: str,
     messages: list,
-    store: IndexStore | None = None,
+    store=None,
 ) -> None:
     """Simple template-based fact extraction as fallback."""
     if not store:
