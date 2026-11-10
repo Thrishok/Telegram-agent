@@ -23,6 +23,12 @@ import json
 import logging
 import os
 import sys
+import selectors
+# Windows compatibility for Psycopg asynchronous connections
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(
+        asyncio.WindowsSelectorEventLoopPolicy()
+    )
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Annotated, Any, TypedDict
@@ -555,9 +561,27 @@ async def webhook_info():
     return response.json()
 
 
+
 if __name__ == "__main__":
-    # psycopg async connections on Windows require SelectorEventLoop.
-    if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+
+    config = uvicorn.Config(
+        app,
+        host="0.0.0.0",
+        port=PORT,
+        loop="asyncio",
+        reload=False,
+    )
+
+    server = uvicorn.Server(config)
+
+    if sys.platform == "win32":
+        # Explicitly create a SelectorEventLoop for Psycopg
+        asyncio.run(
+            server.serve(),
+            loop_factory=lambda: asyncio.SelectorEventLoop(
+                selectors.SelectSelector()
+            ),
+        )
+    else:
+        asyncio.run(server.serve())
